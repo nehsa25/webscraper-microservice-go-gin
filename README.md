@@ -26,7 +26,7 @@ This starts the microservice on port 8080 by default (modifiable in the code).
 
 # Usage:
 
-The service exposes a GET endpoint at /weather/:city (replace :city with the desired city name). You can optionally specify a unit (metric or imperial) in the query parameter unit:
+The service exposes a GET endpoint
 
 http://localhost:8081/scraper?url=https://thp.org/
 
