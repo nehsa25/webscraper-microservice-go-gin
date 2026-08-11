@@ -1,0 +1,17 @@
+# Build output. These are ANCHORED with a leading slash on purpose: a bare
+# `scraper` line also matches the internal/scraper/ DIRECTORY, which silently
+# excludes the entire package from git.
+/scraper
+/scraper.exe
+/webscraper
+/main
+/bin/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

@@ -22,17 +22,28 @@ curl "http://localhost:8081/scraper?url=https://thp.org/"
 
 ### How it picks what to return
 
-`getScrapedData` tries a list of CSS selectors in order and returns the inner HTML of the first one that both matches and is non-empty:
+`Scrape` tries a list of CSS selectors in order and returns the inner HTML of
+the first one that both matches and is non-empty:
 
 ```
 #body, #main, #main-content, #content, #container, #page-content,
-.body, .main, .main-content, "", .wrapper, html
+.body, .main, .main-content, .wrapper, html
 ```
 
-The intent is "find the main content, fall back to the whole document". Two things to know about the list as written:
+The intent is "find the main content, fall back to the whole document".
 
-- **The empty string `""` is in the middle of it.** `doc.Find("")` matches nothing, so it is a no-op — harmless, but it looks like a mistake and probably was one.
-- **`html` at the end** means the fallback returns the entire document, so a page with none of those containers gives you everything including `<head>`.
+- **`html` at the end** means a page with none of those containers still
+  returns something — the entire document, `<head>` included.
+- **The empty string has been removed** from the middle of the list.
+  `doc.Find("")` matches nothing, so it was a no-op that looked like a bug. A
+  test now fails if one is reintroduced.
+- **The response carries `X-Matched-Selector`**, so a caller can tell "found the
+  main content" from "fell back to the whole document" — previously both looked
+  identical.
+
+The list is the package variable `scraper.Selectors`, so it can be overridden.
+Dropping `html` from it makes the service return **404** for a page with no
+recognisable content container, rather than dumping the whole document.
 
 ### Run it
 
@@ -42,7 +53,15 @@ go mod download
 go run .                        # starts on :8081
 ```
 
-Use `go run .`, not `go run main.go` — the entry point lives in **`scraper.go`**, and `main.go` does not exist.
+The entry point is `main.go`, which does nothing but read config, wire
+dependencies and serve; everything worth testing lives in `internal/`.
+
+Note that **by default the service will refuse to fetch a `localhost` URL** —
+see Configuration. For local development against your own machine:
+
+```bash
+ALLOW_PRIVATE_HOSTS=true go run .
+```
 
 ### Run it in Docker
 
@@ -51,32 +70,147 @@ docker build . -t webscraper-microservice
 docker run --rm -p 8081:8081 webscraper-microservice
 ```
 
+The Dockerfile is a multi-stage build onto `distroless/static`, so the runtime
+image carries the binary and nothing else — no shell, no toolchain, no source.
+It runs as `nonroot`, and it deliberately does **not** set
+`ALLOW_PRIVATE_HOSTS`.
+
 ### Configuration
 
-None. No API keys, no environment variables.
+| Variable | Default | What it does |
+|---|---|---|
+| `ADDR` | `:8081` | Listen address |
+| `REQUEST_TIMEOUT_SECONDS` | `15` | How long to wait for the target page |
+| `ALLOW_PRIVATE_HOSTS` | `false` | **Disables the SSRF guard.** Development only |
+
+`ALLOW_PRIVATE_HOSTS` fails safe: only an exact `true` (any casing, surrounding
+whitespace trimmed) enables it, so a typo leaves the guard on. Turning it on
+logs a warning at startup, so an operator reading the logs can see that the
+instance can reach internal addresses.
+
+### The SSRF guard — read this before deploying
+
+A service that fetches an arbitrary caller-supplied URL is a **server-side
+request forgery** primitive. Without validation, anyone who can reach
+`/scraper` can use it to read `http://169.254.169.254/` — which on most cloud
+providers hands out instance credentials — or to probe any host inside the
+network that they cannot reach directly.
+
+The original service had no validation of any kind. It now:
+
+- accepts **only** `http` and `https`, so `file:///etc/passwd`, `gopher://` and
+  `dict://` are refused before the host is even looked at;
+- resolves the hostname and refuses **loopback, link-local, private and
+  unspecified** addresses;
+- requires **every** resolved address to pass, not just the first — a hostname
+  that returns one public and one private address is refused, which is what
+  closes the obvious bypass;
+- does **not follow redirects**, so a redirect to an internal address cannot
+  get around a check performed on the original URL;
+- returns **403** with a flat message that does not say what the name resolved
+  to. Saying so would turn the endpoint into a network-mapping oracle.
+
+**One known gap, stated plainly:** there is still a DNS-rebinding window
+between the check and the connection. Closing it needs a custom dialer that
+re-checks the address it actually connects to. The guard as written stops the
+straightforward attacks, not a determined attacker who controls DNS.
+
+### Endpoints for Kubernetes
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | `{"status":"ok"}` — liveness |
+| `GET /ready` | `{"status":"ready"}` — readiness |
+
+Both answer without fetching anything, so liveness does not depend on the
+whole internet being reachable.
 
 ### Publish
 
 `publish.ps1` builds a timestamped `linux/amd64` image and pushes it to Docker Hub.
 
-### Things worth improving
+### Layout
 
-Noted rather than silently changed, since they alter behaviour:
+```
+main.go                     reads config, wires dependencies, serves — nothing else
+internal/scraper/
+  model.go                  errors, the selector list, the result type  (unit)
+  guard.go                  the SSRF guard                              (unit)
+  scraper.go                fetching and extraction                     (unit + integration)
+internal/httpapi/router.go  gin routes, status codes                    (unit)
+internal/config/config.go   environment parsing                         (unit)
+test/integration/           //go:build integration
+test/e2e/                   //go:build e2e
+```
 
-1. **`getScrapedData` panics instead of returning errors** — on a failed request, on a non-200 status, and on a parse failure. Gin's `Recovery` middleware turns those into a 500 rather than a crash, but it means *a remote site controls whether your handler panics*. Every one of those `panic` calls has an `error` return value sitting right there unused. This is the single most worthwhile fix in the repo.
-2. **No timeout.** `http.Get` uses `http.DefaultClient`, which has **no timeout whatsoever**. One slow target holds a goroutine and a connection open indefinitely. Use an `http.Client{Timeout: 10 * time.Second}` and `http.NewRequestWithContext`.
-3. **`url` is unvalidated.** The service will fetch whatever it is given, including `http://localhost:...`, cloud metadata endpoints like `169.254.169.254`, and internal hostnames — a textbook **SSRF** (server-side request forgery) sink. If this is ever exposed beyond your own machine, validate the scheme, resolve the host, and reject private/loopback/link-local address ranges before fetching.
-4. **`scraper.exe` is committed** (a Windows build artifact), and there is no `.gitignore`. Binaries do not belong in git; the sibling weather repo has a `.gitignore` and this one does not.
-5. **The response is unsanitised HTML** echoed from a third party. Anything rendering this output in a browser inherits an XSS vector.
-6. **No tests** — and see ["Testing"](#testing) below, because a scraper is unusually easy to test with `httptest`.
+### Testing this service
 
----
+```bash
+make test              # unit tier — 83 cases, no network, no setup
+make test-integration  # the assembled stack against a stubbed page server
+make test-e2e          # builds the binary and drives it over HTTP
+make test-all          # all three, fastest failure first
+make cover             # coverage summary
+make ci                # what the GitHub workflow runs
+```
+
+115 tests pass: 83 unit, 15 integration, 17 e2e. Unit statement coverage is
+72.1%; the remainder is `main.go`, which the e2e tier covers as a process.
+
+**The pattern is documented in full at `github.com/nehsa-net/test-go`** — this
+service follows it, and that repo explains what each tier can prove that the
+others cannot.
+
+Two testing details specific to this service, both worth stealing:
+
+- **The resolver is an interface.** `scraper.Resolver` is what makes the guard
+  testable: a test decides that `metadata.test` resolves to `169.254.169.254`
+  and asserts the refusal. Without that seam those cases could only be written
+  on a real cloud instance.
+- **The integration tier pins the dialer** rather than switching the guard off.
+  The client connects to the loopback page server whatever the hostname says,
+  so the guard runs *for real* against a stub resolver. A guard disabled in
+  every test is a guard nobody is testing.
+
+### What changed to make this testable
+
+The service previously had no tests and could not have had useful ones.
+
+1. **The module path.** It was `module scraper`, which nothing can import.
+2. **`Doer` is an interface**, so a test injects a stub HTTP client.
+3. **`Selectors` is a package variable**, not a local inside the fetch
+   function — so the selector priority is a table-driven test.
+4. **`Resolver` is an interface**, which is the only way to test the guard.
+5. **The handler is a named function taking a service**, not a closure inside
+   `main()`.
+
+Every item previously listed under "things worth improving" is now fixed, each
+with a regression test:
+
+- **Four `panic()` calls became errors.** A remote site controlled whether the
+  handler panicked; every one of those calls had an unused `error` return
+  sitting right there.
+- **No timeout** — `http.DefaultClient` has none. There is now a configurable
+  one, plus context propagation.
+- **`url` was unvalidated** — see the SSRF guard above.
+- **`scraper.exe` was committed** and there was no `.gitignore`. Both fixed.
+- **No body size limit.** One request to a page that streams indefinitely would
+  exhaust the container's memory; reads are now capped at 5 MiB.
+- **Internal error detail was echoed to the caller.** The handler returned
+  `err.Error()` verbatim; errors now map to a status code and a flat sentence,
+  with the cause going to the log.
+
+**One item is deliberately still open.** The response is unsanitised HTML from
+a third party, so anything rendering it in a browser inherits an XSS vector.
+Sanitising it here would change what the endpoint returns and break any caller
+that wants the raw markup — so the fix belongs in the consumer, and this is a
+note rather than a silent change.
 
 ## Part 2 — Go reference
 
 Everything below is general-purpose Go. It is deliberately self-contained.
 
-> Written against **Go 1.22+**, the version this module targets (`go 1.22.6` in `go.mod`). Go is exceptionally stable — the Go 1 compatibility promise means code written for 1.0 in 2012 still compiles today — so almost all of this stays true across versions. Version-specific notes are called out inline.
+> Written against **Go 1.24+**, the version this module targets (`go 1.24` in `go.mod`). Go is exceptionally stable — the Go 1 compatibility promise means code written for 1.0 in 2012 still compiles today — so almost all of this stays true across versions. Version-specific notes are called out inline.
 
 ### What Go is, and when to reach for it
 
@@ -193,8 +327,8 @@ myproject/
 `go.mod` for this repo:
 
 ```
-module scraper
-go 1.22.6
+module github.com/nehsa-net/webscraper-microservice-go-gin
+go 1.24
 require (
 	github.com/PuerkitoBio/goquery v1.9.2
 	github.com/gin-gonic/gin v1.10.0
@@ -324,7 +458,7 @@ var ErrNotFound = errors.New("not found")
 - Error strings are lowercase and unpunctuated — they get wrapped into larger sentences.
 - Add context as the error travels up. `"not found"` is useless; `"loading user 42: querying db: not found"` is a bug report.
 - Handle an error **once**. Logging it *and* returning it means it appears twice in your logs from different layers.
-- **`panic` is for programmer error only** — an impossible state, a nil that cannot be nil. A library must not panic on bad input; return an error. `getScrapedData` in this repo panics on any non-200 response, which lets a remote server crash your handler.
+- **`panic` is for programmer error only** — an impossible state, a nil that cannot be nil. A library must not panic on bad input; return an error. This service used to panic on any non-200 response, which let a remote server decide whether the handler crashed; it returns a wrapped error now.
 - `recover()` exists but is for the top of a request handler or goroutine, not routine control flow.
 
 ```go
